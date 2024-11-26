@@ -19,34 +19,37 @@ fn binomial_distribution(items: u32, errors: u32, error_rate: Rational) -> Ratio
         * (Rational::ONE - error_rate).pow(items - errors)
 }
 
-fn num_ops_exact(items: u32, chunks: u32, nonempty_chunks: u32) -> u32 {
-    chunks + nonempty_chunks * items / chunks
-}
+fn num_ops(items: u32, chunks: u32, error_rate: Rational) -> Rational {
+    fn num_ops_exact(items: u32, chunks: u32, nonempty_chunks: u32) -> u32 {
+        chunks + nonempty_chunks * items / chunks
+    }
 
-fn num_ops(items: u32, errors: u32, chunks: u32) -> Rational {
+    fn nonempty_chunk_probability(error_rate: Rational, chunk_size: u32) -> Rational {
+        1 - (Rational::ONE - error_rate).pow(chunk_size)
+    }
+
     debug_assert!(chunks > 0, "zero chunks not allowed");
-    debug_assert!(errors <= items, "more errors than total items");
     debug_assert!(chunks <= items, "more chunks than total items");
-
-    let total_states = c(errors + chunks - 1, errors);
+    debug_assert!(
+        (0. ..=1.).contains(&error_rate),
+        "error rate must be a probability [0, 1]"
+    );
 
     let prob = |nonempty_chunks: u32| {
         debug_assert!(
             nonempty_chunks <= chunks,
-            "more non-empty chunks than total chunks"
+            "more empty chunks than total chunks"
         );
 
-        if nonempty_chunks > errors {
-            return Rational::new();
-        }
-
-        Rational::from((
-            c(chunks, nonempty_chunks) * (c(errors - 1, errors - nonempty_chunks)),
-            total_states.clone(),
-        ))
+        binomial_distribution(
+            chunks,
+            nonempty_chunks,
+            nonempty_chunk_probability(error_rate.clone(), items / chunks),
+        )
     };
 
-    (0..=chunks.min(errors))
+    (0..=chunks)
+        .into_par_iter()
         .map(|nonempty_chunks| {
             prob(nonempty_chunks) * num_ops_exact(items, chunks, nonempty_chunks)
         })
@@ -126,19 +129,11 @@ fn main() {
 
         // Analytic solution
         if !mc_only {
-            let ops = (0..=items)
-                .into_par_iter()
-                .map(|errs| {
-                    binomial_distribution(items, errs, error_rate.clone())
-                        * num_ops(items, errs, chunks)
-                })
-                .sum::<Rational>();
-
             println!(
-                "{: >4} chunks ({: >4} items/chunk) -> {:.1} ops",
+                "{: >4} chunks ({: >4} items/chunk) -> {:.1} ops by analytic method",
                 chunks,
                 items / chunks,
-                ops.to_f64()
+                num_ops(items, chunks, error_rate.clone()).to_f64()
             );
         }
 
