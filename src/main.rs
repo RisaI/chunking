@@ -1,5 +1,5 @@
 use clap::Parser;
-use rand::Rng;
+use rand::{distributions::Bernoulli, prelude::Distribution};
 use rayon::prelude::*;
 use rug::{ops::Pow, Integer, Rational};
 
@@ -7,42 +7,68 @@ fn c(m: u32, n: u32) -> Integer {
     Integer::from(m).binomial(n)
 }
 
-fn binomial_distribution(attempts: u32, successes: u32, probability: Rational) -> Rational {
-    c(attempts, successes)
-        * probability.clone().pow(successes)
-        * (Rational::ONE - probability).pow(attempts - successes)
+fn binomial_distribution(items: u32, errors: u32, error_rate: Rational) -> Rational {
+    debug_assert!(errors <= items, "more errors than total items");
+    debug_assert!(
+        (0. ..=1.).contains(&error_rate),
+        "error rate must be a probability [0, 1]"
+    );
+
+    c(items, errors)
+        * error_rate.clone().pow(errors)
+        * (Rational::ONE - error_rate).pow(items - errors)
 }
 
-fn num_ops_exact(items: u32, chunks: u32, free_chunks: u32) -> u32 {
-    items + chunks - free_chunks * items / chunks
+fn num_ops_exact(items: u32, chunks: u32, nonempty_chunks: u32) -> u32 {
+    chunks + nonempty_chunks * items / chunks
 }
 
 fn num_ops(items: u32, errors: u32, chunks: u32) -> Rational {
+    debug_assert!(chunks > 0, "zero chunks not allowed");
+    debug_assert!(errors <= items, "more errors than total items");
+    debug_assert!(chunks <= items, "more chunks than total items");
+
     let total_states = c(errors + chunks - 1, errors);
 
-    let prob = |empty: u32| {
-        let non_empty = chunks - empty;
+    let prob = |nonempty_chunks: u32| {
+        debug_assert!(
+            nonempty_chunks <= chunks,
+            "more non-empty chunks than total chunks"
+        );
 
-        if non_empty > errors {
+        if nonempty_chunks > errors {
             return Rational::new();
         }
 
         Rational::from((
-            c(chunks, non_empty) * (c(errors - 1, errors - non_empty)),
+            c(chunks, nonempty_chunks) * (c(errors - 1, errors - nonempty_chunks)),
             total_states.clone(),
         ))
     };
 
-    (0..chunks)
-        .map(|free_chunks| (free_chunks, prob(free_chunks)))
-        .skip_while(|(_, p)| p.is_zero())
-        .map(|(free_chunks, p)| p * num_ops_exact(items, chunks, free_chunks))
+    (0..=chunks.min(errors))
+        .map(|nonempty_chunks| {
+            prob(nonempty_chunks) * num_ops_exact(items, chunks, nonempty_chunks)
+        })
         .sum::<Rational>()
 }
 
-fn monte_carlo(items: u32, error_rate: Rational, chunks: u32, sample_size: usize) -> Rational {
-    let numer = error_rate.numer().to_u32().unwrap();
-    let denom = error_rate.denom().to_u32().unwrap();
+fn monte_carlo(
+    items: u32,
+    error_rate: Rational,
+    chunk_size: usize,
+    sample_size: usize,
+) -> Rational {
+    debug_assert!(
+        chunk_size <= items as usize,
+        "chunk is larger than total items"
+    );
+    debug_assert!(
+        (0. ..=1.).contains(&error_rate),
+        "error rate must be a probability [0, 1]"
+    );
+
+    let distr = Bernoulli::new(error_rate.to_f64()).unwrap();
 
     // Average op count
     Rational::from((
@@ -50,12 +76,13 @@ fn monte_carlo(items: u32, error_rate: Rational, chunks: u32, sample_size: usize
             .into_par_iter()
             .map(|_| {
                 // Generate test data
-                let test = (0..items)
-                    .map(|_| rand::thread_rng().gen_ratio(numer, denom))
-                    .collect::<Box<_>>();
+                let test = distr
+                    .sample_iter(rand::thread_rng())
+                    .take(items as usize)
+                    .collect::<Box<[bool]>>();
 
                 // Calculate operations for each chunk
-                test.chunks_exact((items / chunks) as usize)
+                test.chunks(chunk_size)
                     .map(|ch| {
                         Integer::from(if ch.iter().any(|v| *v) {
                             ch.len() + 1
@@ -77,6 +104,9 @@ struct Options {
 
     #[clap(long)]
     mc_samples: Option<usize>,
+
+    #[clap(long)]
+    mc_only: bool,
 }
 
 fn main() {
@@ -84,6 +114,7 @@ fn main() {
         items,
         expected_errors,
         mc_samples,
+        mc_only,
     } = Options::parse();
 
     let error_rate = Rational::from((expected_errors, items));
@@ -94,20 +125,22 @@ fn main() {
         }
 
         // Analytic solution
-        let ops = (0..=items)
-            .into_par_iter()
-            .map(|errs| {
-                binomial_distribution(items, errs, error_rate.clone())
-                    * num_ops(items, errs, chunks)
-            })
-            .sum::<Rational>();
+        if !mc_only {
+            let ops = (0..=items)
+                .into_par_iter()
+                .map(|errs| {
+                    binomial_distribution(items, errs, error_rate.clone())
+                        * num_ops(items, errs, chunks)
+                })
+                .sum::<Rational>();
 
-        println!(
-            "{: >4} chunks ({: >4} items/chunk) -> {:.1} ops",
-            chunks,
-            items / chunks,
-            ops.to_f64()
-        );
+            println!(
+                "{: >4} chunks ({: >4} items/chunk) -> {:.1} ops",
+                chunks,
+                items / chunks,
+                ops.to_f64()
+            );
+        }
 
         // Monte-Carlo solution
         if let Some(mc_samples) = mc_samples {
@@ -115,7 +148,13 @@ fn main() {
                 "{: >4} chunks ({: >4} items/chunk) -> {:.1} ops by monte carlo",
                 chunks,
                 items / chunks,
-                monte_carlo(items, error_rate.clone(), chunks, mc_samples).to_f64()
+                monte_carlo(
+                    items,
+                    error_rate.clone(),
+                    (items / chunks) as usize,
+                    mc_samples
+                )
+                .to_f64()
             );
         }
     }
